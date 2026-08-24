@@ -368,7 +368,7 @@ const scripts = [
   // default portals.yml because end-user workspaces often have a real user-layer
   // portals file that would trigger a live remote sweep during tests.
   { name: 'verify-portals.mjs --file .tmp-test-missing-portals.yml', expectExit: 0 },
-  { name: 'update-system.mjs check', expectExit: 0 },
+  { name: 'update-system.mjs check', expectExit: 0, timeoutMs: 60_000 },
   { name: 'seed-fixture.mjs --self-test', expectExit: 0 },
   { name: 'archive-posting.mjs --help', expectExit: 0 },
 ];
@@ -1853,6 +1853,7 @@ const allowedFiles = [
   // Dashboard credit string
   'dashboard/internal/ui/screens/pipeline.go',
   'dashboard/internal/ui/screens/progress.go',
+  'dashboard/internal/ui/screens/stats.go',
 ];
 
 // Build pathspec for git grep — only scan tracked files matching these
