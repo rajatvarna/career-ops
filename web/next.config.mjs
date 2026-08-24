@@ -11,15 +11,10 @@ const nextConfig = {
   // whole project" warnings. career-ops data lives in the parent checkout
   // (or CAREER_OPS_ROOT) and is read at runtime — never bundled.
   outputFileTracingRoot: import.meta.dirname,
+  // Exclude user-data dirs from the lambda bundle. Paths must stay inside
+  // outputFileTracingRoot — Turbopack rejects "../…" globs on Vercel (#92978).
   outputFileTracingExcludes: {
     "*": [
-      "../data/**/*",
-      "../reports/**/*",
-      "../jds/**/*",
-      "../output/**/*",
-      "../.career-ops-web/**/*",
-      "../interview-prep/**/*",
-      "../batch/**/*",
       "./.next/**/*",
       "**/data/**/*",
       "**/reports/**/*",

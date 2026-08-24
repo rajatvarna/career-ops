@@ -18,7 +18,7 @@ import { acquireTrackerWrite, releaseTrackerWrite } from "@/lib/core/run-registr
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 800; // a real oferta evaluation / pdf-mode CV tailoring + render is heavy and multi-step
+export const maxDuration = 300; // Vercel hobby cap; Pro allows up to 800s for heavy evaluate/pdf runs
 
 export async function POST(req: Request) {
   let body: { kind?: string; input?: string; cliId?: string };
@@ -198,7 +198,7 @@ export async function POST(req: Request) {
       let lastCostUsd: number | null = null;
       // pdf-mode's agent only tailors content now (rendering moved to the
       // backend, #2172) — but its killMs still has to leave real headroom
-      // inside the route's overall maxDuration (800s): the render+mark phase
+      // inside the route's overall maxDuration (300s on Vercel hobby): the render+mark phase
       // (renderPdf, below) starts only after this timer's window and has no
       // timeout of its own, so an agent that runs close to its full budget
       // would otherwise leave the platform's hard maxDuration cutoff to kill
@@ -218,7 +218,7 @@ export async function POST(req: Request) {
           controller.enqueue(enc.encode(JSON.stringify(obj) + "\n"));
         } catch {
           // The client is gone. Stop the heartbeat here rather than waiting for
-          // close(): the child can still run for minutes (maxDuration 800s), and
+          // close(): the child can still run for minutes (maxDuration 300s on hobby), and
           // a user retrying a failed run would otherwise accumulate one live
           // timer per abandoned request.
           closed = true;
