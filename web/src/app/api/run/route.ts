@@ -44,7 +44,7 @@ export async function POST(req: Request) {
   // root is incomplete instead of faking it.
   const needsScript: Record<string, string> = { evaluate: "modes/oferta.md", "fix-portal": "verify-portals.mjs", pdf: "generate-pdf.mjs" };
   const required = needsScript[kind];
-  if (required && !fs.existsSync(path.join(careerOpsRoot(), required))) {
+  if (required && !fs.existsSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ careerOpsRoot(), required))) {
     return new Response(
       JSON.stringify({
         error: `This needs a complete career-ops checkout (${required}). CAREER_OPS_ROOT has data only — point it at a full checkout.`,
@@ -66,7 +66,7 @@ export async function POST(req: Request) {
 
   // An A–F score is meaningless without a CV to score against — the CLI would
   // hallucinate a fit narrative and still emit a VERDICT. Require cv.md first.
-  if ((kind === "evaluate" || kind === "pdf") && !fs.existsSync(path.join(careerOpsRoot(), "cv.md"))) {
+  if ((kind === "evaluate" || kind === "pdf") && !fs.existsSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ careerOpsRoot(), "cv.md"))) {
     return new Response(
       JSON.stringify({ error: "Add your CV first so I can score this against you — drop it on the home page." }),
       { status: 400, headers: { "Content-Type": "application/json" } },
@@ -125,10 +125,10 @@ export async function POST(req: Request) {
   // Names, not a count: reserving a number writes reports/NNN-RESERVED.md and the
   // final report REPLACES it, so the `.md` count is unchanged and a count-delta
   // gate reported "didn't save a report" for an evaluation that saved fine (#2085).
-  const reportsDir = path.join(careerOpsRoot(), "reports");
+  const reportsDir = path.join(/* turbopackIgnore: true */ careerOpsRoot(), "reports");
   const reportEntries = () => {
     try {
-      return fs.readdirSync(reportsDir);
+      return fs.readdirSync(/* turbopackIgnore: true */ reportsDir);
     } catch {
       return [];
     }
