@@ -7,6 +7,16 @@ import { spawn } from "node:child_process";
 // JS modules must be fully specified.
 
 /**
+ * Quote one argv token for cmd.exe when building a `shell: true` command line.
+ * Node joins spawn argv without escaping when shell is enabled, so every token
+ * (including user prompts) must be quoted or `&`, `|`, `>`, `"`, etc. inject.
+ */
+export function quoteCmdArg(s) {
+  const str = String(s);
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
+/**
  * Spawn a headless agent CLI with stdin closed.
  *
  * CLIs such as `codex exec` read additional prompt text from stdin when a pipe
@@ -28,10 +38,17 @@ import { spawn } from "node:child_process";
  */
 export function spawnHeadlessCli(binPath, args, options) {
   // npm global shims on Windows are .cmd/.bat wrappers; Node cannot spawn them
-  // directly (EINVAL) — only with shell: true.
+  // directly (EINVAL) — only with shell: true. shell:true joins argv without
+  // escaping, so quote every token for cmd.exe before passing a single command.
   const needsShell =
     process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath);
-  const child = spawn(binPath, args, needsShell ? { ...options, shell: true } : options);
+  let spawnCmd = binPath;
+  let spawnArgs = args;
+  if (needsShell) {
+    spawnCmd = [quoteCmdArg(binPath), ...args.map(quoteCmdArg)].join(" ");
+    spawnArgs = [];
+  }
+  const child = spawn(spawnCmd, spawnArgs, needsShell ? { ...options, shell: true } : options);
   child.stdin?.end();
   return child;
 }

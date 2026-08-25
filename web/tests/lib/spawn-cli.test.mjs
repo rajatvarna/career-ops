@@ -6,7 +6,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnHeadlessCli } from "../../src/lib/spawn-cli.mjs";
+import { spawnHeadlessCli, quoteCmdArg } from "../../src/lib/spawn-cli.mjs";
+
+test("quoteCmdArg wraps metacharacters for cmd.exe", () => {
+  assert.equal(quoteCmdArg("hello world"), '"hello world"');
+  assert.equal(quoteCmdArg('say "hi"'), '"say ""hi"""');
+  assert.equal(quoteCmdArg("a & b | c"), '"a & b | c"');
+});
 
 test("spawnHeadlessCli closes stdin so a headless CLI can start", async () => {
   // Given: a child that only speaks once its stdin has reached EOF — a stand-in
