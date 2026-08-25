@@ -27,7 +27,11 @@ import { spawn } from "node:child_process";
  * @param {import("node:child_process").SpawnOptionsWithoutStdio} options
  */
 export function spawnHeadlessCli(binPath, args, options) {
-  const child = spawn(binPath, args, options);
+  // npm global shims on Windows are .cmd/.bat wrappers; Node cannot spawn them
+  // directly (EINVAL) — only with shell: true.
+  const needsShell =
+    process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath);
+  const child = spawn(binPath, args, needsShell ? { ...options, shell: true } : options);
   child.stdin?.end();
   return child;
 }

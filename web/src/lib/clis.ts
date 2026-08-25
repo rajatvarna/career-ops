@@ -111,8 +111,9 @@ function binCandidates(bin: string): string[] {
     // Only include extensions that `child_process.spawn()` can execute directly.
     .filter((e) => [".com", ".exe", ".bat", ".cmd"].includes(e.toLowerCase()));
 
-  // Try the bare name too (some environments provide an extensionless shim).
-  return [bin, ...exts.map((ext) => bin + ext)];
+  // Extensions before the bare name. npm's extensionless global shim passes
+  // access(X_OK) but child_process.spawn() cannot execute it on Windows (ENOENT).
+  return [...exts.map((ext) => bin + ext), bin];
 }
 
 export function findBin(bin: string, dirs = searchDirs()): string | null {
