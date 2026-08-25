@@ -385,6 +385,9 @@ try {
   const copyDirSync = (src, dest, exclude = []) => {
     const name = src.split(/[\\/]/).pop();
     if (EXCLUDE_AT_ANY_DEPTH.has(name)) return;
+    // Killed runs leave sibling `.tmp-script-test-*` dirs; copying them nests
+    // fixtures pathologically on Windows (MAX_PATH / ENOENT during stat).
+    if (name.startsWith('.tmp-script-test-')) return;
     // Everything else is a top-level workspace dir (data/, reports/, …) and is
     // matched by basename ONLY at the repo root, so nested fixture subdirs such
     // as test-fixtures/upgrade/state-*/data and .../reports still get copied.
