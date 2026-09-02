@@ -4,7 +4,7 @@
  * generate-pdf.mjs — HTML → PDF via Playwright
  *
  * Usage:
- *   node career-ops/generate-pdf.mjs <input.html> <output.pdf> [--format=letter|a4] [--report=NNN] [--allow-reorder] [--max-pages=N] [--strict-pages]
+ *   node career-ops/generate-pdf.mjs <input.html> <output.pdf> [--format=letter|a4] [--report=NNN] [--allow-reorder] [--max-pages=N] [--strict-pages] [--skip-fact-check]
  *   node career-ops/generate-pdf.mjs --batch=<manifest.json> [--format=letter|a4] [--allow-reorder] [--max-pages=N] [--strict-pages]
  *
  * --batch renders every document in a JSON manifest (an array of
@@ -39,11 +39,13 @@ import { readFile } from 'fs/promises';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { randomUUID } from 'node:crypto';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 import { readStyleTokens, injectThemeStyle, readCvSectionOrder } from './theme-style.mjs';
 import { resolvePdfIndexPath, resolveTrackerPath, resolveWorkspaceRoot } from './tracker-utils.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const trackerPath = resolveTrackerPath(__dirname);
+const trackerPath = resolveTrackerPath(getCareerOpsRoot());
 const workspaceRoot = resolveWorkspaceRoot(trackerPath);
 const PDF_PAGE_MARGIN = '0.6in';
 
@@ -260,6 +262,7 @@ const SECTION_ALIASES = new Map([
   ['awards & honours', 'awards'],
   ['skills', 'skills'],
   ['technical skills', 'skills'],
+  ['interests', 'interests'],
   // Polish — the vocabulary documented in modes/pl/README.md, plus the word-order
   // variants that turn up in practice (both "Kompetencje kluczowe" and
   // "Kluczowe kompetencje" are used for the same section).
@@ -1084,6 +1087,7 @@ function updatePDFManifest(reportNum, pdfPath, htmlPath, format) {
  */
 async function generatePDF() {
   const args = process.argv.slice(2);
+  let skipFactCheck = false;
 
   // Parse arguments
   let inputPath, outputPath, format = 'a4', reportNum = '', allowReorder = false;
@@ -1103,6 +1107,8 @@ async function generatePDF() {
       allowReorder = true;
     } else if (arg === '--strict-pages') {
       strictPages = true;
+    } else if (arg === '--skip-fact-check') {
+      skipFactCheck = true;
     } else if (!inputPath) {
       inputPath = arg;
     } else if (!outputPath) {
@@ -1208,6 +1214,32 @@ async function generatePDF() {
   if (totalReplacements > 0) {
     const breakdown = Object.entries(normalized.replacements).map(([k, v]) => `${k}=${v}`).join(', ');
     console.log(`🧹 ATS normalization: ${totalReplacements} replacements (${breakdown})`);
+  }
+
+  // Fact gate. generate-cover-letter.mjs already blocks on assertFacts before
+  // importing Playwright, on the reasoning that a failed gate must not leave a
+  // misleading artifact behind. A tailored CV is the same class of document and
+  // carries the numbers a reader acts on, but the CV path enforced the gate only
+  // as an instructed step in the mode prompts — so a programmatic caller (a
+  // bridge, a script, a batch run) rendered inflated metrics in silence. Gate the
+  // normalized HTML, which is the document that actually prints.
+  if (!skipFactCheck && cvMarkdown) {
+    // Imported lazily, INSIDE the guard. A static import is resolved at module
+    // load whether or not this branch runs, and the page-budget/batch suites copy
+    // generate-pdf.mjs alone into a temp workspace — a static import of a sibling
+    // that isn't copied made every one of those suites die with
+    // ERR_MODULE_NOT_FOUND before reaching the behaviour under test. Those
+    // fixtures also ship no cv.md, so this branch is never entered there. If the
+    // module is genuinely missing in a real workspace this throws and the render
+    // fails, which is the correct direction to fail for a fact gate.
+    const { assertFacts } = await import('./verify-cv-facts.mjs');
+    const factCheck = assertFacts(html, { label: basename(inputPath) });
+    if (factCheck.verdict === 'warn') {
+      console.warn(`⚠️  CV fact check warning: ${basename(inputPath)}`);
+      for (const phrase of factCheck.warnings) console.warn(`  - advisory phrase: ${phrase}`);
+    } else {
+      console.log('✅ Fact check passed');
+    }
   }
 
   return renderHtmlToPdf(html, outputPath, {
@@ -1470,6 +1502,7 @@ export async function inlineLocalFonts(html) {
  *   baseDir?: string,
  *   reportNum?: string,
  *   inputPath?: string,
+ *   workspaceRoot?: string,
  *   maxPages?: number,
  *   strictPages?: boolean,
  *   launchBrowser?: (options: {headless: boolean}) => Promise<import('playwright').Browser>
@@ -1519,9 +1552,25 @@ export async function renderHtmlToPdf(html, outputPath, opts = {}) {
  */
 async function renderInPage(browser, html, outputPath, opts = {}) {
   const format = opts.format || 'a4';
-  const baseDir = opts.baseDir || process.cwd();
+  const outputRoot = opts.workspaceRoot || workspaceRoot;
+  const requestedBaseDir = resolve(opts.baseDir || outputRoot);
+  // Temporary HTML is an output too: never let an external input path or
+  // caller-supplied baseDir choose an arbitrary directory. If the requested
+  // directory is outside the tracker workspace (or escapes through a symlink),
+  // keep the render workspace-owned while still allowing the input itself to
+  // be read.
+  const baseDir = isWorkspaceOutputPath(
+    resolve(requestedBaseDir, '.career-ops-render-anchor'),
+    outputRoot,
+  ) ? requestedBaseDir : resolve(outputRoot);
   const reportNum = opts.reportNum || '';
   const inputPath = opts.inputPath || '';
+
+  // Reject an escaping destination before creating directories, launching
+  // Chromium, or writing any renderer temporary files (#2844).
+  if (!isWorkspaceOutputPath(outputPath, outputRoot)) {
+    throw new Error(`Refusing to write the PDF outside the tracker workspace: ${outputPath}`);
+  }
 
   mkdirSync(dirname(outputPath), { recursive: true });
 
@@ -1589,7 +1638,8 @@ async function renderInPage(browser, html, outputPath, opts = {}) {
       preferCSSPageSize: true,
     });
 
-    // Write PDF
+    // Write PDF only after rendering has completed. Renderer cleanup still runs
+    // if an injected browser fails before producing a buffer.
     await writeFile(outputPath, pdfBuffer);
 
     // Read the root page-tree count so page-like text in streams is ignored.
@@ -1699,7 +1749,7 @@ export async function renderBatch(entries, opts = {}) {
   }
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+const isMain = isMainModule(import.meta.url);
 if (isMain) {
   generatePDF().catch((err) => {
     console.error('❌ PDF generation failed:', err.message);

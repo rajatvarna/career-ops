@@ -14,16 +14,17 @@ try {
 } catch (e) {}
 
 import { readFileSync, existsSync } from 'fs';
-import { pathToFileURL } from 'url';
 import * as yaml from 'js-yaml';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { appendToPipeline, appendToScanHistory, loadSeenUrls } from './scan.mjs';
+import { appendToPipeline, appendToScanHistory, loadSeenUrls, PORTALS_PATH } from './scan.mjs';
+import { localToday } from './lib/local-today.mjs';
 
 // Import the deterministic provider
 import hnProvider from './providers/hackernews.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 // ── Configuration ────────────────────────────────────────────────────
-const PORTALS_PATH = 'portals.yml';
+// Imported from scan.mjs so it honors CAREER_OPS_PORTALS and the data root (#3510).
 
 function loadKeywords() {
   const defaultKeywords = ["Software Engineer"];
@@ -113,11 +114,11 @@ async function main() {
 
   if (newOffers.length > 0) {
     await appendToPipeline(newOffers);
-    await appendToScanHistory(newOffers, new Date().toISOString().slice(0, 10), 'added');
+    await appendToScanHistory(newOffers, localToday(), 'added');
     console.log(`\n🎉 Success: ${newOffers.length} offers added.`);
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+if (isMainModule(import.meta.url)) {
   main().catch(err => { console.error("Fatal:", err.message); process.exit(1); });
 }
