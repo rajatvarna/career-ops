@@ -3,8 +3,8 @@
  * openai-eval.mjs — OpenAI-compatible Job Offer Evaluator for career-ops
  *
  * Evaluate job offers with ANY OpenAI-compatible chat endpoint instead of Claude.
- * Works with OpenAI, OpenRouter, Together, Groq, DeepSeek, Zhipu GLM, MiniMax,
- * Fireworks, and local servers that speak the OpenAI API (LM Studio, llama.cpp,
+ * Works with OpenAI, OpenRouter, Requesty, Cheaper Inference, API Route, Runcrate, CloudGPU, Together, Groq, DeepSeek, Zhipu GLM,
+ * MiniMax, Fireworks, and local servers that speak the OpenAI API (LM Studio, llama.cpp,
  * vLLM, Ollama's /v1). Point it at a base URL + model + key and go.
  *
  * Reads evaluation logic from modes/oferta.md + modes/_shared.md, reads the
@@ -30,7 +30,9 @@
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { randomUUID } from 'crypto';
+import { getCareerOpsRoot, getProfilePath } from './path-resolver.mjs';
+import { localToday } from './lib/local-today.mjs';
 import { TSV_ADDITION_HEADER } from './tracker-parse.mjs';
 import { outputLanguageInstruction, parseOutputLanguage } from './profile-language.mjs';
 import {
@@ -38,6 +40,16 @@ import {
 } from './reserve-report-num.mjs';
 import { TokenAccumulator, formatBreakdown, normalizeOpenAIUsage } from './utils/token-tracker.mjs';
 import { buildBudgetedPrompt } from './lib/context-budget.mjs';
+import { endpointHeaders } from './lib/endpoint-headers.mjs';
+import { assertLlmRequestAllowed } from './lib/llm-outbound.mjs';
+import { installPiiInterceptor } from './lib/pii-interceptor.mjs';
+import {
+  isPostingUrl, normalizedTrackerScore, slugifyCompany, tsvSafe,
+} from './lib/tracker-addition.mjs';
+
+// Ambient guard over global fetch (idempotent); the explicit gate below is the
+// primary layer, this covers anything the script hands to fetch directly.
+installPiiInterceptor();
 
 const tracker = new TokenAccumulator();
 tracker.recordZeroToken('scan');
@@ -58,7 +70,9 @@ const PATHS = {
   shared:  join(ROOT, 'modes', '_shared.md'),
   oferta:  join(ROOT, 'modes', 'oferta.md'),
   cv:        join(DATA_ROOT, 'cv.md'),
-  profileYml: join(DATA_ROOT, 'config', 'profile.yml'),
+  profileYml: getProfilePath(),
+  profile:    join(DATA_ROOT, 'modes', '_profile.md'),
+  custom:     join(DATA_ROOT, 'modes', '_custom.md'),
   reports:    join(DATA_ROOT, 'reports'),
   // CAREER_OPS_ADDITIONS mirrors merge-tracker.mjs:43. Writing under DATA_ROOT
   // regardless would drop the addition somewhere the merge it instructs never
@@ -88,7 +102,8 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
 
   OPTIONS
     --file <path>    Read JD from a file instead of inline text
-    --model <id>     Model id            (env OPENAI_MODEL, default gpt-4o-mini)
+    --model <id>     Model id            (env OPENAI_MODEL; MiniMax direct default
+                                         MiniMax-M3.1-Flash, otherwise gpt-4o-mini)
     --url <base>     OpenAI-compatible base URL, including any /v1
                      (env OPENAI_BASE_URL, default https://api.openai.com/v1)
     --key <key>      API key             (env OPENAI_API_KEY)
@@ -103,10 +118,17 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
 
   PROVIDER EXAMPLES (cheap / free-tier friendly — addresses token cost)
     OpenRouter:  --url https://openrouter.ai/api/v1   --model deepseek/deepseek-chat
+    Requesty:    --url https://router.requesty.ai/v1  --model deepseek/deepseek-chat
+    Cheaper Inference: --url https://api.cheaperinference.com/v1  --model gpt-5.4-mini
+    API Route:   --url https://global.api-route.com/v1  --model gpt-5.5
+    Runcrate:    --url https://api.runcrate.ai/v1  --model deepseek-ai/DeepSeek-V4.1-Flash
+    CloudGPU:    --url https://cloudgpu.app/v1  --model deepseek-v4.1-flash
     Together:    --url https://api.together.xyz/v1     --model meta-llama/Llama-3.3-70B-Instruct-Turbo
     Groq:        --url https://api.groq.com/openai/v1  --model llama-3.3-70b-versatile
     DeepSeek:    --url https://api.deepseek.com/v1     --model deepseek-chat
     Zhipu GLM:   --url https://open.bigmodel.cn/api/paas/v4  --model glm-4-flash
+    MiniMax:     --url https://api.minimax.io/v1       --model MiniMax-M3.1-Flash
+                 --url https://api.minimax.cn/v1       --model MiniMax-M3
     LM Studio:   --url http://localhost:1234/v1        --model <loaded-model>   (no key)
 
   EXAMPLES
@@ -119,7 +141,7 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
 // Parse flags
 let jdText     = '';
 let postingUrl = '';
-let modelName  = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+let modelName  = process.env.OPENAI_MODEL || '';
 let baseUrl    = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
 let apiKey     = process.env.OPENAI_API_KEY || '';
 let saveReport = true;
@@ -189,6 +211,13 @@ let endpointHost;
     process.exit(1);
   }
   endpointHost = parsed.hostname;
+  // Resolve the default after CLI flags, without replacing saved/custom models.
+  // Limit this to the direct API; subscription and gateway routes are separate.
+  if (!modelName) {
+    const isMiniMax = ['https://api.minimax.io', 'https://api.minimax.cn'].includes(parsed.origin)
+      && parsed.pathname === '/v1';
+    modelName = isMiniMax ? 'MiniMax-M3.1-Flash' : 'gpt-4o-mini';
+  }
   const isLoopback = endpointHost === 'localhost' || endpointHost === '127.0.0.1' || endpointHost === '::1';
 
   if (!isLoopback && parsed.protocol !== 'https:') {
@@ -235,80 +264,6 @@ function readFile(path, label) {
 }
 
 // ---------------------------------------------------------------------------
-// Tracker-addition helpers
-// ---------------------------------------------------------------------------
-/**
- * Whether a value is a complete http(s) URL, and so can become a dedup key.
- * @param {string} value - Candidate posting URL.
- * @returns {boolean} True only for a parseable http/https URL with a host.
- */
-function isPostingUrl(value) {
-  try {
-    const parsed = new URL(value);
-    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname !== '';
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Slugify a company name for report/addition filenames.
- * @param {string} value - Raw company name.
- * @returns {string} Lowercase dash slug, or "unknown" when nothing survives.
- */
-function slugifyCompany(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '') || 'unknown';
-}
-
-/**
- * Flatten a value into a single TSV cell (tabs and newlines would shift columns).
- * @param {*} value - Raw cell value.
- * @returns {string} Single-line, trimmed cell.
- */
-function tsvSafe(value) {
-  return String(value ?? '').replace(/[\t\r\n]+/g, ' ').trim();
-}
-
-/**
- * Normalize a model-reported score into the tracker's score cell.
- *
- * A missing or unparseable score becomes the documented `N/A` sentinel rather
- * than an empty cell — `looksLikeScoreCell` in tracker-parse.mjs recognizes
- * `N/A`, and a blank or unrecognized placeholder makes the row ambiguous and
- * gets it skipped with a warning (#1799).
- *
- * @param {string} value - Score as extracted from the model's summary block.
- * @returns {string} `X.X/5` or `N/A`.
- */
-function normalizedTrackerScore(value) {
-  const clean = tsvSafe(value);
-  // Parse, do not pattern-match the string. Two bugs lived in the old guard:
-  // `/n\/?a/i` was unanchored with an optional slash, so bare `na` matched and a
-  // real score with trailing prose -- `4.2 (final)`, `4.2 (internal)`,
-  // `4.5 - strong signal` -- was recorded as `N/A`; and the `/5` early return kept
-  // the whole string, so `4.2/10` became `4.2/5` and merged as a genuine score.
-  // Trailing prose is tolerated because models produce it; a denominator that is
-  // not 5, or a value outside 0..5, is refused rather than reinterpreted.
-  const parsed = clean.match(/^(\d+(?:\.\d+)?)/);
-  if (!parsed) return 'N/A';
-  const score = parseFloat(parsed[1]);
-  // The denominator is load-bearing wherever it sits. Requiring it immediately
-  // after the number read `4.2 (strong fit)/10` -- a ten-point score with an
-  // annotation -- as a bare 4.2 and wrote `4.2/5`, the same wrong number
-  // `8/10` used to produce. The first denominator in the cell is taken and must
-  // be 5; absent one, the scale is the contract's. A cell that puts an unrelated
-  // fraction first (`4.2 (fit 3/4 axes)`) is refused rather than guessed at --
-  // N/A is recoverable, a wrong score is not.
-  const denominator = clean.match(/\/\s*(\d+(?:\.\d+)?)/);
-  const scale = denominator ? parseFloat(denominator[1]) : 5;
-  if (!Number.isFinite(score) || scale !== 5 || score < 0 || score > 5) return 'N/A';
-  return `${score}/5`;
-}
-
-// ---------------------------------------------------------------------------
 // Load context files
 // ---------------------------------------------------------------------------
 console.log('\n📂  Loading context files...');
@@ -317,6 +272,9 @@ const sharedContext = readFile(PATHS.shared,     'modes/_shared.md');
 const ofertaLogic   = readFile(PATHS.oferta,     'modes/oferta.md');
 const cvContent     = readFile(PATHS.cv,         'cv.md');
 const profileYml    = readFile(PATHS.profileYml, 'config/profile.yml');
+const profileContent = readFile(PATHS.profile,   'modes/_profile.md');
+// _custom.md is optional: an absent file is a valid end state, so no warning.
+const customContent = existsSync(PATHS.custom) ? readFileSync(PATHS.custom, 'utf-8').trim() : '';
 const languageInstruction = outputLanguageInstruction(parseOutputLanguage(profileYml));
 
 // ---------------------------------------------------------------------------
@@ -327,9 +285,11 @@ const { contextBody, budgetReport } = buildBudgetedPrompt({
   ofertaContent: ofertaLogic,
   cvContent,
   profileYml,
+  profileContent,
+  customContent,
   jdText,
   noCompress,
-  maxTokens: 128_000, // gpt-4o-mini context window
+  modelName,
 });
 
 // Log token budget info
@@ -377,7 +337,7 @@ LEGITIMACY: <High Confidence | Proceed with Caution | Suspicious>
 // OpenRouter runner. The static prefix (shared + oferta + cv, ~12K tokens) is
 // byte-identical across every offer, yet was re-sent and re-billed each call.
 //
-// Host-gated on purpose: OpenAI-compatible gateways (OpenRouter, DeepSeek, …)
+// Host-gated on purpose: OpenAI-compatible gateways (OpenRouter, Requesty, DeepSeek, …)
 // honor an ephemeral `cache_control` breakpoint on the prefix and reuse it
 // across back-to-back calls within the cache TTL. api.openai.com instead caches
 // long prefixes automatically and may reject the non-standard field, so it gets
@@ -402,26 +362,39 @@ if (Number.isNaN(timeoutMs) || timeoutMs <= 0) {
 console.log(`\n🔒  Privacy: your cv.md + JD will be sent to ${endpointHost}.`);
 console.log(`🤖  Calling ${modelName} via ${endpointHost}... this may take a minute.\n`);
 
+// One evaluation is one conversation: a single id for every request in this run.
+const SESSION_ID = randomUUID();
+// VERSION may carry a release-please marker ("1.38.0 # x-release-please-version").
+let careerOpsVersion;
+try { careerOpsVersion = readFileSync(join(ROOT, 'VERSION'), 'utf-8').trim().split(/\s+/)[0] || undefined; } catch { /* default User-Agent version */ }
+
 const headers = { 'Content-Type': 'application/json' };
 if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+// OpenCode Go asks for a session id and an own user agent (observed: HTTP 400 MissingSessionID without it):
+// https://opencode.ai/v2/docs/console/go/#where-can-i-use-it
+Object.assign(headers, endpointHeaders(endpointHost, SESSION_ID, careerOpsVersion));
 
 let evaluationText;
 try {
+  // Privacy gate: inspect the complete serialized request before it leaves the
+  // machine. Shared boundary so openai-eval and openai-tailor cannot diverge.
+  const requestBody = JSON.stringify({
+    model:    modelName,
+    messages: [
+      buildSystemMessage(systemPrompt, endpointHost),
+      { role: 'user', content: `JOB DESCRIPTION TO EVALUATE:\n\n${jdText}` },
+    ],
+    stream:      true,
+    temperature: 0.4,
+  });
+  assertLlmRequestAllowed(endpoint, requestBody);
   // Streaming (SSE): llama.cpp/Unsloth brauchen bei langen Generationen den
   // sofortigen Header; Non-Streaming läuft in Node/undici in den 5-Minuten-
   // Header-Timeout, bevor die erste Zeile ankommt (8 t/s × 22k-Prefill).
   const res = await fetch(endpoint, {
     method: 'POST',
     headers,
-    body: JSON.stringify({
-      model:    modelName,
-      messages: [
-        buildSystemMessage(systemPrompt, endpointHost),
-        { role: 'user', content: `JOB DESCRIPTION TO EVALUATE:\n\n${jdText}` },
-      ],
-      stream:      true,
-      temperature: 0.4,
-    }),
+    body: requestBody,
     signal: AbortSignal.timeout(timeoutMs),
   });
 
@@ -525,7 +498,17 @@ if (saveReport) {
 
     reservedNumbers   = await reserveReportNumbers(1, { rootDir: ROOT, reportsDir: PATHS.reports });
     const num         = formatReportNumber(reservedNumbers[0]);
-    const today       = new Date().toISOString().split('T')[0];
+    // LOCAL calendar day (#3070). This one value becomes three things that have to
+    // agree with each other and with the user's calendar: the report FILENAME
+    // ({num}-{slug}-{today}.md), the report's own `**Date:**` header, and the date
+    // column of the tracker row written for it.
+    //
+    // On the UTC day an evaluation run on a Sunday evening in the Americas produces
+    // 042-acme-2026-08-18.md, dated the 18th, in a tracker row dated the 18th —
+    // while every other date the user sees, and every date the other scripts now
+    // stamp, says the 17th. The filename is the part that cannot be corrected
+    // later: reports are addressed by it.
+    const today       = localToday();
     const companySlug = slugifyCompany(company);
     const filename    = `${num}-${companySlug}-${today}.md`;
     const reportPath  = join(PATHS.reports, filename);
