@@ -25,7 +25,8 @@
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getCareerOpsRoot } from './path-resolver.mjs';
+import { getCareerOpsRoot, getProfilePath } from './path-resolver.mjs';
+import { localToday } from './lib/local-today.mjs';
 import { TSV_ADDITION_HEADER } from './tracker-parse.mjs';
 import { outputLanguageInstruction, parseOutputLanguage } from './profile-language.mjs';
 import {
@@ -33,6 +34,15 @@ import {
 } from './reserve-report-num.mjs';
 import { TokenAccumulator, formatBreakdown, normalizeOpenAIUsage } from './utils/token-tracker.mjs';
 import { buildBudgetedPrompt } from './lib/context-budget.mjs';
+import { assertLlmRequestAllowed } from './lib/llm-outbound.mjs';
+import { installPiiInterceptor } from './lib/pii-interceptor.mjs';
+import {
+  isPostingUrl, normalizedTrackerScore, slugifyCompany, tsvSafe,
+} from './lib/tracker-addition.mjs';
+
+// Ambient guard over global fetch (idempotent); the explicit gate below is the
+// primary layer.
+installPiiInterceptor();
 
 const tracker = new TokenAccumulator();
 tracker.recordZeroToken('scan');
@@ -54,7 +64,8 @@ const PATHS = {
   oferta:  join(ROOT, 'modes', 'oferta.md'),
   cv:      join(DATA_ROOT, 'cv.md'),
   profile: join(DATA_ROOT, 'modes', '_profile.md'),
-  profileYml: join(DATA_ROOT, 'config', 'profile.yml'),
+  custom:  join(DATA_ROOT, 'modes', '_custom.md'),
+  profileYml: getProfilePath(),
   reports: join(DATA_ROOT, 'reports'),
   // CAREER_OPS_ADDITIONS mirrors merge-tracker.mjs:43. Writing under DATA_ROOT
   // regardless would drop the addition somewhere the merge it instructs never
@@ -182,80 +193,6 @@ function readFile(path, label) {
 }
 
 // ---------------------------------------------------------------------------
-// Tracker-addition helpers
-// ---------------------------------------------------------------------------
-/**
- * Whether a value is a complete http(s) URL, and so can become a dedup key.
- * @param {string} value - Candidate posting URL.
- * @returns {boolean} True only for a parseable http/https URL with a host.
- */
-function isPostingUrl(value) {
-  try {
-    const parsed = new URL(value);
-    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname !== '';
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Slugify a company name for report/addition filenames.
- * @param {string} value - Raw company name.
- * @returns {string} Lowercase dash slug, or "unknown" when nothing survives.
- */
-function slugifyCompany(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '') || 'unknown';
-}
-
-/**
- * Flatten a value into a single TSV cell (tabs and newlines would shift columns).
- * @param {*} value - Raw cell value.
- * @returns {string} Single-line, trimmed cell.
- */
-function tsvSafe(value) {
-  return String(value ?? '').replace(/[\t\r\n]+/g, ' ').trim();
-}
-
-/**
- * Normalize a model-reported score into the tracker's score cell.
- *
- * A missing or unparseable score becomes the documented `N/A` sentinel rather
- * than an empty cell — `looksLikeScoreCell` in tracker-parse.mjs recognizes
- * `N/A`, and a blank or unrecognized placeholder makes the row ambiguous and
- * gets it skipped with a warning (#1799).
- *
- * @param {string} value - Score as extracted from the model's summary block.
- * @returns {string} `X.X/5` or `N/A`.
- */
-function normalizedTrackerScore(value) {
-  const clean = tsvSafe(value);
-  // Parse, do not pattern-match the string. Two bugs lived in the old guard:
-  // `/n\/?a/i` was unanchored with an optional slash, so bare `na` matched and a
-  // real score with trailing prose -- `4.2 (final)`, `4.2 (internal)`,
-  // `4.5 - strong signal` -- was recorded as `N/A`; and the `/5` early return kept
-  // the whole string, so `4.2/10` became `4.2/5` and merged as a genuine score.
-  // Trailing prose is tolerated because models produce it; a denominator that is
-  // not 5, or a value outside 0..5, is refused rather than reinterpreted.
-  const parsed = clean.match(/^(\d+(?:\.\d+)?)/);
-  if (!parsed) return 'N/A';
-  const score = parseFloat(parsed[1]);
-  // The denominator is load-bearing wherever it sits. Requiring it immediately
-  // after the number read `4.2 (strong fit)/10` -- a ten-point score with an
-  // annotation -- as a bare 4.2 and wrote `4.2/5`, the same wrong number
-  // `8/10` used to produce. The first denominator in the cell is taken and must
-  // be 5; absent one, the scale is the contract's. A cell that puts an unrelated
-  // fraction first (`4.2 (fit 3/4 axes)`) is refused rather than guessed at --
-  // N/A is recoverable, a wrong score is not.
-  const denominator = clean.match(/\/\s*(\d+(?:\.\d+)?)/);
-  const scale = denominator ? parseFloat(denominator[1]) : 5;
-  if (!Number.isFinite(score) || scale !== 5 || score < 0 || score > 5) return 'N/A';
-  return `${score}/5`;
-}
-
-// ---------------------------------------------------------------------------
 // Loopback guard — cv.md + full JD are sent to this endpoint.
 // A remote URL would silently exfiltrate private data.
 // ---------------------------------------------------------------------------
@@ -309,6 +246,8 @@ const sharedContext = readFile(PATHS.shared, 'modes/_shared.md');
 const ofertaLogic   = readFile(PATHS.oferta, 'modes/oferta.md');
 const cvContent     = readFile(PATHS.cv,     'cv.md');
 const profileContent = readFile(PATHS.profile, 'modes/_profile.md');
+// _custom.md is optional: an absent file is a valid end state, so no warning.
+const customContent = existsSync(PATHS.custom) ? readFileSync(PATHS.custom, 'utf-8').trim() : '';
 const profileYml    = readFile(PATHS.profileYml, 'config/profile.yml');
 const languageInstruction = outputLanguageInstruction(parseOutputLanguage(profileYml));
 
@@ -321,6 +260,7 @@ const { contextBody, budgetReport } = buildBudgetedPrompt({
   cvContent,
   profileYml,
   profileContent,
+  customContent,
   jdText,
   maxTokens: numCtx, // matches options.num_ctx below
 });
@@ -378,28 +318,33 @@ console.log(`🤖  Calling Ollama (${modelName})... this may take a minute.\n`);
 
 let evaluationText;
 try {
+  // Privacy gate: inspect the complete serialized request before the network
+  // call. Ollama may be local, but it may equally be a remote host set via
+  // OLLAMA_BASE_URL — either way the payload is checked.
+  const requestBody = JSON.stringify({
+    model:    modelName,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: `JOB DESCRIPTION TO EVALUATE:\n\n${jdText}` },
+    ],
+    // stream:true so response headers arrive with the FIRST token. With stream:false
+    // Ollama sends nothing until the whole report is generated, and Node's undici client
+    // gives up at its own 300s headersTimeout — a deadline neither OLLAMA_TIMEOUT_MS nor
+    // AbortSignal.timeout controls, which surfaced as a bare "fetch failed" at 5:01.
+    stream: true,
+    // Ollama's native /api/chat reads generation params from `options` only.
+    // This call targets that endpoint (NOT the OpenAI-compatible /v1 route,
+    // which ignores `options` and has no num_ctx equivalent), so both the
+    // deterministic temperature and the enlarged context window actually take
+    // effect. Without num_ctx here Ollama defaults to a 2048-token context and
+    // silently truncates the prompt; without temperature it runs at 0.8.
+    options: { temperature: 0.4, num_ctx: numCtx },
+  });
+  assertLlmRequestAllowed(endpoint, requestBody);
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model:    modelName,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: `JOB DESCRIPTION TO EVALUATE:\n\n${jdText}` },
-      ],
-      // stream:true so response headers arrive with the FIRST token. With stream:false
-      // Ollama sends nothing until the whole report is generated, and Node's undici client
-      // gives up at its own 300s headersTimeout — a deadline neither OLLAMA_TIMEOUT_MS nor
-      // AbortSignal.timeout controls, which surfaced as a bare "fetch failed" at 5:01.
-      stream: true,
-      // Ollama's native /api/chat reads generation params from `options` only.
-      // This call targets that endpoint (NOT the OpenAI-compatible /v1 route,
-      // which ignores `options` and has no num_ctx equivalent), so both the
-      // deterministic temperature and the enlarged context window actually take
-      // effect. Without num_ctx here Ollama defaults to a 2048-token context and
-      // silently truncates the prompt; without temperature it runs at 0.8.
-      options: { temperature: 0.4, num_ctx: numCtx },
-    }),
+    body: requestBody,
     signal: AbortSignal.timeout(timeoutMs),
   });
 
@@ -517,7 +462,17 @@ if (saveReport) {
 
     reservedNumbers   = await reserveReportNumbers(1, { rootDir: ROOT, reportsDir: PATHS.reports });
     const num         = formatReportNumber(reservedNumbers[0]);
-    const today       = new Date().toISOString().split('T')[0];
+    // LOCAL calendar day (#3070). This one value becomes three things that have to
+    // agree with each other and with the user's calendar: the report FILENAME
+    // ({num}-{slug}-{today}.md), the report's own `**Date:**` header, and the date
+    // column of the tracker row written for it.
+    //
+    // On the UTC day an evaluation run on a Sunday evening in the Americas produces
+    // 042-acme-2026-08-18.md, dated the 18th, in a tracker row dated the 18th —
+    // while every other date the user sees, and every date the other scripts now
+    // stamp, says the 17th. The filename is the part that cannot be corrected
+    // later: reports are addressed by it.
+    const today       = localToday();
     const companySlug = slugifyCompany(company);
     const filename    = `${num}-${companySlug}-${today}.md`;
     const reportPath  = join(PATHS.reports, filename);

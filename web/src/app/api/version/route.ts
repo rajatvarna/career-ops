@@ -11,7 +11,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function readVersion(): string {
-  const candidates = [path.join(/* turbopackIgnore: true */ process.cwd(), "..", "VERSION"), path.join(/* turbopackIgnore: true */ process.cwd(), "VERSION")];
+  const candidates = [path.join(process.cwd(), "..", "VERSION"), path.join(process.cwd(), "VERSION")];
   for (const p of candidates) {
     try {
       // Candidate roots differ between `next dev` and the packaged app. They
@@ -27,7 +27,9 @@ function readVersion(): string {
 
 function shortSha(): string {
   try {
-    return execSync("git rev-parse --short HEAD", { cwd: process.cwd(), stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    // windowsHide: see api/doctor/route.ts — a stale inherited console kills
+    // every child with 0xC0000142 on Windows; never inherit one.
+    return execSync("git rev-parse --short HEAD", { cwd: process.cwd(), stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).toString().trim();
   } catch {
     return "";
   }
@@ -35,7 +37,7 @@ function shortSha(): string {
 
 function webVersion(): string {
   try {
-    const pkg = JSON.parse(fs.readFileSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ process.cwd(), "package.json"), "utf8"));
+    const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"));
     return typeof pkg.version === "string" ? pkg.version : "";
   } catch {
     return "";

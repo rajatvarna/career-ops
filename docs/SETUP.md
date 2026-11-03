@@ -2,9 +2,9 @@
 
 ## Prerequisites
 
-- An AI coding CLI — [Claude Code](https://claude.ai/code), Gemini CLI, Codex, Qwen Code, OpenCode, GitHub Copilot CLI, Antigravity CLI, or Grok Build CLI (see [Supported CLIs](SUPPORTED_CLIS.md))
-- [Node.js](https://nodejs.org) 18+ and `git` (`npx` ships with Node — the installer refuses to run without them) — note: the Gemini CLI integration requires Node.js 20+
-- (Optional) Go 1.21+ (for the dashboard TUI)
+- An AI coding CLI — [Claude Code](https://claude.ai/code), Codex, Qwen Code, OpenCode, Pi, GitHub Copilot CLI, Antigravity CLI, Grok Build CLI, or Hermes Agent (see [Supported CLIs](SUPPORTED_CLIS.md))
+- [Node.js](https://nodejs.org) 22.13+ and `git` (`npx` ships with Node — the installer refuses to run without them). 22.13 is the first release where `node:sqlite`, used by the tracker index (see [tracker](SCRIPTS.md#tracker)), needs no flag
+- (Optional) Go 1.26+ (for the dashboard TUI)
 
 ## Quick Start
 
@@ -44,8 +44,8 @@ browser storage:
 That also means a normal web-session branch push does **not** persist them to
 GitHub: a new cloud session starts from the repository again, without the
 ignored files from the previous VM. Keep a personal workflow in one session
-and move any output you need to secure storage before its environment expires.
-Never force-add these paths. For a durable workspace shared across many
+and move any output you need to secure storage before its environment expires
+([backup patterns](BACKUP_STRATEGIES.md)). Never force-add these paths. For a durable workspace shared across many
 sessions, use the local quick start below.
 
 ### Recommended — one command
@@ -121,6 +121,8 @@ PDFs are rendered with a headless Chromium. Install it once per machine:
 ```bash
 npx playwright install chromium
 ```
+
+On NixOS, skip this step: the browsers it downloads can't run there. Use the flake dev shell instead, as described in [NIXOS.md](NIXOS.md).
 
 ## Available Commands
 
