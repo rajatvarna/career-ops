@@ -1,5 +1,6 @@
 # career-ops web — self-contained ignore (does not touch core root .gitignore)
 /node_modules
+/node_modules-stale
 /.next*
 /out
 /dist
