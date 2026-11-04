@@ -32,6 +32,7 @@ All scripts live in the project root as `.mjs` modules. Most are exposed via
 | `npm run extract` | `browser-extract.mjs` | Headless read-only page extractor (opt-in `scan.extractor: cli`) — compact JSON for scan/JD; a posting whose ATS is in `JD_TEXT_API_ATS` (`liveness-api.mjs`) is first read without a browser, falling back to the page when that read is inconclusive, and an empty jd extraction exits 1 with `code: empty_text` |
 | `node fetch-jd.mjs <url>` | `fetch-jd.mjs` | JD text on stdout, read without a browser (including canonical and short-link Workable postings with description, requirements and benefits), for a posting whose ATS is in `JD_TEXT_API_ATS` (`liveness-api.mjs`) — exit 1 with empty stdout for any other ATS and for an inconclusive read, so a caller falls back to its browser/WebFetch path |
 | `npm run scan` | `scan.mjs` | Zero-token portal scanner |
+| `npm run triage` | `triage.mjs` | Zero-token first-glance triage of pending postings into a shortlist |
 | `npm run scan:full` | `scan-ats-full.mjs` | Reverse ATS discovery scanner |
 | `npm run scan:hn` | `scan-hn.mjs` | Hacker News "Who is hiring?" scanner, filtered by `hn_hiring.keywords` |
 | `node web/scripts/scheduled-jobs-runner.mjs` | `web/scripts/scheduled-jobs-runner.mjs` | Run one due local scheduled scan (normally invoked by the OS scheduler: Task Scheduler, launchd or cron) |
@@ -993,6 +994,42 @@ Defaults are unchanged, so a single-lane setup needs none of this. Note that the
 **Progress:** every 25 sources, and once at the end, the scan prints a line such as `[14:02:31] scan: 50/120 sources done` to stderr. It prints under `--quiet` too, so a long unattended scan never looks stalled, and it stays out of the `--json` receipt on stdout.
 
 **Exit codes:** `0` scan completed, `1` configuration error or no portals.yml found.
+
+---
+
+## triage
+
+Zero-token first-glance triage of the pending queue (#1729). Judges every row in
+`data/pipeline.md`'s `## Pending` section on **title + location alone** — the two
+fields the scanner already wrote — against your `config/profile.yml` targets
+(`target_roles.primary` and `target_roles.archetypes`), and writes a grouped
+shortlist to `data/shortlist.md`. Pure Node: no network, no LLM, no JD read, and
+`data/pipeline.md` is left untouched.
+
+Buckets (same contract as the triage prompt proposed in #1729):
+
+- **Worth a look** — title clearly matches a primary/secondary target AND the
+  location fits (remote, or your profile's city/country).
+- **Maybe** — partial title match, adjacent-tier match, a strong title whose
+  location is missing or needs relocation, or a bare pasted URL with no title.
+- **Skip** — title matches no target role. Location alone never sends a row here.
+
+Title matching is deliberately literal (token overlap with a small
+canonicalization layer: `Machine Learning` = `ML`, `Front-End` = `Frontend`, …).
+To widen the net, add title variants to `target_roles` in your profile — that is
+a profile edit, not a code change.
+
+`data/shortlist.md` is derived and rewritten on every successful run — safe to
+delete. Error exits (bad profile, no targets) leave the previous shortlist in place.
+
+```bash
+npm run triage                # triage ## Pending into data/shortlist.md
+node triage.mjs --json        # same pass, buckets as JSON on stdout
+node scan.mjs --triage        # chain it after a scan (ideal for scheduled runs)
+```
+
+**Exit codes:** `0` shortlist written (or nothing to triage yet), `1` missing or
+invalid `config/profile.yml` / no `target_roles` configured.
 
 ---
 
