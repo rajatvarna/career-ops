@@ -118,6 +118,9 @@ config/privacy.yml
 # update-system.mjs. Gitignored on purpose: it describes THIS clone, not the
 # project, and must survive the sync that overwrites update-system.mjs (#2421).
 config/local-paths.txt
+# System overlay declarations — lists system files where local edits are
+# three-way merged with upstream on every update instead of being frozen (#4326).
+config/system-overlay.txt
 portals.yml
 modes/_profile.md
 modes/_custom.md
@@ -159,6 +162,11 @@ reports/*-RESERVED.md
 # form, which for cv.md or portals.yml leaves a file holding the same PII as the
 # original sitting untracked in the repo root. Trailing `*` covers both.
 *.bak*
+# Overlay merge artifacts: .base is the upstream anchor written per-run; .overlay-base is
+# the persistent cross-run anchor kept after a clean merge (see update-system.mjs apply()).
+# Neither should ever be committed.
+*.base
+*.overlay-base
 
 # Atomic-write temp files, the sibling of the backups above and from the same
 # two writers: `.{name}.{pid}.{ts}.{uuid}.tmp` (tracker-utils.mjs
