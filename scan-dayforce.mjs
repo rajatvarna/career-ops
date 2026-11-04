@@ -69,7 +69,9 @@ import { loadYaml } from './lib/yaml-document.mjs';
 import {
   appendToPipeline,
   appendToScanHistory,
+  appendUnrecordedToScanHistory,
   loadSeenUrls,
+  scanHistoryPolicy,
   normalizeUrlForDedup,
   buildTitleFilter,
   buildLocationFilter,
@@ -389,7 +391,8 @@ export function loadConfig(portalsPath = PORTALS_PATH, singleTenant = null) {
     matchedTitleKeywords: (title) => matchedTitleKeywords(title, config.title_filter),
   };
 
-  return { boards, invalidCount, filters };
+  // The recheck window scan.mjs applies to the same seen set.
+  return { boards, invalidCount, filters, historyPolicy: scanHistoryPolicy(config) };
 }
 
 // ── Fetch helpers (all run through page.request — same context, same cookies) ──
@@ -626,7 +629,7 @@ export async function scanBoardWithRetry(boardCfg, filters, {
 async function main() {
   const { dryRun, debug, singleTenant } = parseArgs();
   mkdirSync(join(DATA_ROOT, 'data'), { recursive: true });
-  const { boards, invalidCount, filters } = loadConfig(PORTALS_PATH, singleTenant);
+  const { boards, invalidCount, filters, historyPolicy } = loadConfig(PORTALS_PATH, singleTenant);
 
   if (invalidCount > 0) {
     console.log(`  Skipping ${invalidCount} malformed dayforce_boards entr${invalidCount === 1 ? 'y' : 'ies'} (bad tenant/board/culture/jobBoardId)`);
@@ -637,7 +640,7 @@ async function main() {
     return;
   }
 
-  const { seen } = loadSeenUrls();
+  const { seen } = loadSeenUrls(historyPolicy);
   const date = localToday();
 
   let totalFound = 0;
@@ -681,12 +684,14 @@ async function main() {
   if (!dryRun) {
     if (newOffers.length > 0) await appendToPipeline(newOffers);
     if (newOffers.length > 0) await appendToScanHistory(newOffers, date, 'added');
-    if (titleSkipped.length > 0) await appendToScanHistory(titleSkipped, date, 'skipped_title');
-    if (locationSkipped.length > 0) await appendToScanHistory(locationSkipped, date, 'skipped_location');
-    if (contentSkipped.length > 0) await appendToScanHistory(contentSkipped, date, 'skipped_content');
-    if (countryEligibilitySkipped.length > 0) await appendToScanHistory(countryEligibilitySkipped, date, 'skipped_country_eligibility');
-    if (visaSkipped.length > 0) await appendToScanHistory(visaSkipped, date, 'skipped_visa');
-    if (dupeSkipped.length > 0) await appendToScanHistory(dupeSkipped, date, 'skipped_dup');
+    // Every run hands the same skipped postings back, so each is recorded
+    // once per status, not once per run (#2695, as scan.mjs records its own).
+    await appendUnrecordedToScanHistory(titleSkipped, date, 'skipped_title');
+    await appendUnrecordedToScanHistory(locationSkipped, date, 'skipped_location');
+    await appendUnrecordedToScanHistory(contentSkipped, date, 'skipped_content');
+    await appendUnrecordedToScanHistory(countryEligibilitySkipped, date, 'skipped_country_eligibility');
+    await appendUnrecordedToScanHistory(visaSkipped, date, 'skipped_visa');
+    await appendUnrecordedToScanHistory(dupeSkipped, date, 'skipped_dup');
   }
 
   console.log(`\n${'━'.repeat(45)}`);

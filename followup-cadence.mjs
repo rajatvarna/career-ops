@@ -253,7 +253,7 @@ const APPLIED_DATE_HAS_DATE_RE = new RegExp(APPLIED_DATE_SOURCE, 'i');
 //     row must not fail a whole report.
 //
 // @param {string} notes
-// @param {{requireValidCalendarDate?: boolean}} [options]
+// @param {{requireValidCalendarDate?: boolean, requireExactDate?: boolean}} [options]
 export function parseAppliedDate(notes, options = {}) {
   if (!notes) return null;
   const validateCalendar = options.requireValidCalendarDate === true;
@@ -261,7 +261,7 @@ export function parseAppliedDate(notes, options = {}) {
 
   const matches = [];
   for (const m of text.matchAll(APPLIED_DATE_RE)) {
-    if (!validateCalendar || isRealCalendarDate(m[1])) matches.push({ date: m[1], index: m.index });
+    if (!validateCalendar || isRealCalendarDate(m[1])) matches.push({ date: m[1], index: m.index, approximate: m[0].endsWith(`~${m[1]}`) });
   }
   if (matches.length === 0) return null;
 
@@ -274,7 +274,9 @@ export function parseAppliedDate(notes, options = {}) {
   // First-wins is preserved among a row's OWN dates: a later status date must
   // not displace the submission date (see the fixture in test-all.mjs).
   // Cross-reference filtering is orthogonal to that ordering rule.
-  if (own.length > 0) return own[0].date;
+  // Certainty belongs to the selected own mention, not another date in the
+  // note. An estimated first date must not fall through to a later exact one.
+  if (own.length > 0) return options.requireExactDate && own[0].approximate ? null : own[0].date;
 
   // Every apply-date in the note belongs to another row, so this note does not
   // state when THIS row was submitted. Returning null is the honest answer —
@@ -798,14 +800,23 @@ export function contactLabel(contact) {
 export function resolveReportPath(reportField, appsFile = APPS_FILE, repoRoot = CAREER_OPS) {
   const target = firstLinkTarget(reportField);
   if (target == null) return null;
-  // Report links in the tracker are normalized relative to the tracker file's
-  // own directory (see PR #760 — `merge-tracker.mjs --migrate`). Resolve against
-  // dirname(APPS_FILE), not the project root, otherwise relative paths like
-  // `../reports/...` (the data/applications.md layout) escape above the project.
-  const fullPath = join(dirname(appsFile), target);
-  const repoRelative = relative(repoRoot, fullPath).split(sep).join('/');
-  if (repoRelative.startsWith('../') || repoRelative === '..' || !repoRelative.startsWith('reports/')) return null;
-  return existsSync(fullPath) ? repoRelative : null;
+  // Two shapes name the same file. Writers emit a repo-root link,
+  // `(reports/file.md)`, and merge-tracker rewrites it relative to the tracker
+  // directory, `(../reports/file.md)` (PR #760). Try the tracker-relative path
+  // first. A link with no `..` segment is also tried from the repo root, which
+  // is where the unmigrated shape actually lives. A `..` segment is not given
+  // that second try, so the link cannot walk out of reports/.
+  const candidates = [join(dirname(appsFile), target)];
+  if (!target.startsWith('/') && !target.split(/[\\/]/).includes('..')) {
+    const fromRoot = join(repoRoot, target);
+    if (fromRoot !== candidates[0]) candidates.push(fromRoot);
+  }
+  for (const fullPath of candidates) {
+    const repoRelative = relative(repoRoot, fullPath).split(sep).join('/');
+    if (repoRelative.startsWith('../') || repoRelative === '..' || !repoRelative.startsWith('reports/')) continue;
+    if (existsSync(fullPath)) return repoRelative;
+  }
+  return null;
 }
 
 // --- Compute urgency ---
@@ -814,7 +825,17 @@ export function resolveReportPath(reportField, appsFile = APPS_FILE, repoRoot = 
 // days) — matching the cadence table in modes/followup.md ("Responded: every
 // 3 days · Assessment uses the responded cadence · Interview: thank-you, then
 // every 3 days, no limit").
-export function computeUrgency(status, daysSinceApp, daysSinceLastFollowup, followupCount) {
+//
+// `hasRepliableContact` says whether the tracker notes name somebody who can be
+// written to. For a thread where the company has already replied, a due
+// follow-up with a person on the other end is `urgent`, and one with nobody to
+// write to stays `overdue`. Without this, `urgent` was reachable only while
+// daysSinceApp < responded_initial (1 day), so a live thread aged into
+// `overdue` within a day and read the same as a dead no-reply row. It defaults
+// to false, so existing callers behave as before. `applied` is not escalated:
+// no reply has arrived, so a contact address is not evidence of a conversation.
+export function computeUrgency(status, daysSinceApp, daysSinceLastFollowup, followupCount, hasRepliableContact = false) {
+  const due = hasRepliableContact ? 'urgent' : 'overdue';
   if (status === 'applied') {
     if (followupCount >= CADENCE.applied_max_followups) return 'cold';
     if (followupCount === 0 && daysSinceApp >= CADENCE.applied_first) return 'overdue';
@@ -823,17 +844,17 @@ export function computeUrgency(status, daysSinceApp, daysSinceLastFollowup, foll
   }
   if (status === 'responded' || status === 'assessment') {
     if (daysSinceLastFollowup !== null) {
-      return daysSinceLastFollowup >= CADENCE.responded_subsequent ? 'overdue' : 'waiting';
+      return daysSinceLastFollowup >= CADENCE.responded_subsequent ? due : 'waiting';
     }
     if (daysSinceApp < CADENCE.responded_initial) return 'urgent';
-    if (daysSinceApp >= CADENCE.responded_subsequent) return 'overdue';
+    if (daysSinceApp >= CADENCE.responded_subsequent) return due;
     return 'waiting';
   }
   if (status === 'interview') {
     if (daysSinceLastFollowup !== null) {
-      return daysSinceLastFollowup >= CADENCE.responded_subsequent ? 'overdue' : 'waiting';
+      return daysSinceLastFollowup >= CADENCE.responded_subsequent ? due : 'waiting';
     }
-    return daysSinceApp >= CADENCE.interview_thankyou ? 'overdue' : 'waiting';
+    return daysSinceApp >= CADENCE.interview_thankyou ? due : 'waiting';
   }
   return 'waiting';
 }
@@ -941,7 +962,10 @@ export function analyzeFromContent(trackerContent, followupsContent = '', { enab
       if (lastDate) daysSinceLastFollowup = daysBetween(lastDate, now);
     }
 
-    let urgency = computeUrgency(normalized, daysSinceApp, daysSinceLastFollowup, followupCount);
+    // Extracted before urgency: whether a person can be written to is an input to it.
+    const contacts = extractContacts(app.notes);
+    const hasRepliableContact = contacts.some((c) => (c.email && !/no-?reply|donotreply/i.test(c.email)) || c.name);
+    let urgency = computeUrgency(normalized, daysSinceApp, daysSinceLastFollowup, followupCount, hasRepliableContact);
     let nextFollowupDate = computeNextFollowupDate(normalized, appliedDate, lastFollowupDate, followupCount);
 
     // A pinned next-date takes precedence over the computed cadence (explicit
@@ -964,7 +988,6 @@ export function analyzeFromContent(trackerContent, followupsContent = '', { enab
     const nextDate = nextFollowupDate ? parseDate(nextFollowupDate) : null;
     const daysUntilNext = nextDate ? daysBetween(now, nextDate) : null;
 
-    const contacts = extractContacts(app.notes);
     const reportPath = resolveReportPath(app.report);
 
     entries.push({

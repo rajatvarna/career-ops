@@ -180,6 +180,11 @@ function buildSnapshot() {
 }
 
 async function cmdList() {
+  const problem = readPluginConfigListError(DATA_ROOT);
+  if (problem) {
+    console.error(problem);
+    process.exit(1);
+  }
   warnConfigLeftInCodeRoot(ROOT, DATA_ROOT);
   const cfg = await loadPluginConfig(DATA_ROOT);
   await loadDotenvOnce(DATA_ROOT);
@@ -208,6 +213,11 @@ async function cmdList() {
 }
 
 async function cmdRun(args) {
+  const problem = readPluginConfigListError(DATA_ROOT);
+  if (problem) {
+    console.error(problem);
+    process.exit(1);
+  }
   const dryRun = args.includes('--dry-run');
   const positional = args.filter(a => a !== '--dry-run');
   const token = positional[0];
@@ -251,6 +261,12 @@ async function cmdRun(args) {
     const payload = hook === 'search' ? positional.slice(hookArgStart).join(' ') : undefined;
     if (hook === 'search' && !payload) { console.error(`search needs a query: node plugins.mjs run ${id} search "<query>"`); process.exit(1); }
     const results = filterResultsForId(await runHook(hook, payload, { root: ROOT, dataRoot: DATA_ROOT, dryRun, pluginId: id }), id);
+    exitIfPluginDidNotRun(results, id, hook);
+    const failed = results.filter(r => !r.ok);
+    if (failed.length) {
+      for (const r of failed) console.error(`${r.id} ${hook} failed: ${r.error}`);
+      process.exit(1);
+    }
     const found = results.filter(r => r.ok && Array.isArray(r.result)).flatMap(r => r.result).map(sanitizeJob).filter(Boolean);
     const { jobs, counts } = admitPluginJobs(found, {
       id,
@@ -280,19 +296,43 @@ async function cmdRun(args) {
     const rowCount = snapshot.applications.length;
     const timeoutMs = Math.min(120_000, Math.max(15_000, rowCount * 3_000));
     const results = filterResultsForId(await runHook('export', snapshot, { root: ROOT, dataRoot: DATA_ROOT, dryRun, timeoutMs, pluginId: id }), id);
+    exitIfPluginDidNotRun(results, id, 'export');
+    let failed = false;
     for (const r of results) {
       if (r.ok) console.log(`${r.id} export: pushed ${r.result?.pushed ?? 0} record(s).`);
-      else console.log(`${r.id} export: failed — ${r.error}`);
+      else {
+        console.error(`${r.id} export failed: ${r.error}`);
+        failed = true;
+      }
     }
+    if (failed) process.exit(1);
     return;
   }
 
   if (hook === 'notify') {
     const message = positional.slice(hookArgStart).join(' ') || '(career-ops notification)';
     const results = filterResultsForId(await runHook('notify', { message }, { root: ROOT, dataRoot: DATA_ROOT, dryRun, pluginId: id }), id);
-    for (const r of results) console.log(r.ok ? `${r.id} notify: sent.` : `${r.id} notify: failed — ${r.error}`);
+    exitIfPluginDidNotRun(results, id, 'notify');
+    let failed = false;
+    for (const r of results) {
+      if (r.ok) console.log(`${r.id} notify: sent.`);
+      else {
+        console.error(`${r.id} notify failed: ${r.error}`);
+        failed = true;
+      }
+    }
+    if (failed) process.exit(1);
     return;
   }
+}
+
+// An empty result list means the selected plugin never ran. The integrity
+// gate and a failed import already printed why. A hook that ran and returned
+// no jobs is a one-element ok result, not an empty list.
+function exitIfPluginDidNotRun(results, id, hook) {
+  if (results.length > 0) return;
+  console.error(`${id} ${hook} did not run.`);
+  process.exit(1);
 }
 
 function findManifest(id) {
@@ -369,6 +409,41 @@ export function parsePluginConfig(raw, file) {
     throw new Error(`${file} does not contain a YAML mapping — refusing to overwrite it. Nothing was changed.`);
   }
   return cfg;
+}
+
+/**
+ * Why `list` and `run` stop. Scan keeps loadPluginConfig's fail-open read.
+ * Null when the file is absent, empty, or a YAML mapping.
+ * @param {string|null} raw
+ * @param {string} [file]
+ * @returns {string|null}
+ */
+export function pluginConfigListError(raw, file = 'config/plugins.yml') {
+  if (raw == null) return null;
+  try {
+    parsePluginConfig(raw, file);
+    return null;
+  } catch (err) {
+    const first = String(err.message).split('\n')[0];
+    const yaml = first.match(/valid YAML \((.*)\) —/);
+    const detail = yaml ? yaml[1] : (first.includes('YAML mapping') ? 'the file is not a YAML mapping' : first);
+    return `${file}: ${detail}. A broken file is not the same as every plugin being off. Fix ${file}, then run: node plugins.mjs list`;
+  }
+}
+
+function readPluginConfigListError(root) {
+  const rel = 'config/plugins.yml';
+  const file = path.join(root, rel);
+  // Read first and treat only ENOENT as absent. existsSync says false for a
+  // file in a config/ this user cannot search, which would list every plugin as off.
+  let raw;
+  try {
+    raw = readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') return null;
+    return `${rel} could not be read (${err.message}). Fix the file, then run: node plugins.mjs list`;
+  }
+  return pluginConfigListError(raw, rel);
 }
 
 // Write enabled:true/false into config/plugins.yml, merging (never clobbering

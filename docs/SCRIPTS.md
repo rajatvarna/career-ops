@@ -32,6 +32,7 @@ All scripts live in the project root as `.mjs` modules. Most are exposed via
 | `npm run extract` | `browser-extract.mjs` | Headless read-only page extractor (opt-in `scan.extractor: cli`) — compact JSON for scan/JD; a posting whose ATS is in `JD_TEXT_API_ATS` (`liveness-api.mjs`) is first read without a browser, falling back to the page when that read is inconclusive, and an empty jd extraction exits 1 with `code: empty_text` |
 | `node fetch-jd.mjs <url>` | `fetch-jd.mjs` | JD text on stdout, read without a browser (including canonical and short-link Workable postings with description, requirements and benefits), for a posting whose ATS is in `JD_TEXT_API_ATS` (`liveness-api.mjs`) — exit 1 with empty stdout for any other ATS and for an inconclusive read, so a caller falls back to its browser/WebFetch path |
 | `npm run scan` | `scan.mjs` | Zero-token portal scanner |
+| `npm run triage` | `triage.mjs` | Zero-token first-glance triage of pending postings into a shortlist |
 | `npm run scan:full` | `scan-ats-full.mjs` | Reverse ATS discovery scanner |
 | `npm run scan:hn` | `scan-hn.mjs` | Hacker News "Who is hiring?" scanner, filtered by `hn_hiring.keywords` |
 | `node web/scripts/scheduled-jobs-runner.mjs` | `web/scripts/scheduled-jobs-runner.mjs` | Run one due local scheduled scan (normally invoked by the OS scheduler: Task Scheduler, launchd or cron) |
@@ -831,8 +832,8 @@ Possible JSON responses:
 | `up-to-date` | Local version matches remote |
 | `update-available` | Newer version exists (includes `local`, `remote`, `changelog`) |
 | `dismissed` | User said no to this release (`update-system.mjs dismiss --version X.Y.Z`); a newer release reports again |
-| `offline` | Could not reach GitHub |
-| `no-remote-version` | GitHub answered without a usable `career-ops-vX.Y.Z` release |
+| `offline` | Could not reach GitHub (carries `detail`: what failed and why). With `--channel main`, both curl sources and a `git ls-remote` fallback failed |
+| `no-remote-version` | GitHub answered without a usable `career-ops-vX.Y.Z` release (with `--channel main`, may carry `detail` when the git fallback reached upstream but found no release tag) |
 | `worktree-without-main` | Run from a linked git worktree while no checkout has `main` checked out (see **update** below) |
 
 `check --force` ignores a dismissal. `check --channel main` keeps the previous behaviour for installs that follow `main`: main's `VERSION` plus system-file drift (`reason: system-files-changed`).
@@ -934,7 +935,7 @@ Zero-token portal scanner. Runs configured local parsers for SSR/static career p
 
 `--rediscover-404` also recognizes authoritative API 404/410 verdicts: for a tracked company with a careers domain, it searches that domain and requires a confirmed live replacement before migrating the URL. Soft closure signals do not trigger rediscovery.
 
-`scan_history.recheck_after_days` in `portals.yml` lets old `added` and `skipped_expired` URLs become eligible for recheck after the configured number of days. If absent, scan-history dedup keeps the historical behavior and dedups forever. Permanent invalid statuses such as blocked host and malformed URL remain permanent.
+`scan_history.recheck_after_days` in `portals.yml` lets old `added` and `skipped_expired` URLs become eligible for recheck after the configured number of days. If absent, scan-history dedup keeps the historical behavior and dedups forever. Under the window a `skipped_dup` row lasts while any other scan-history row for the URL still pins it, whatever its own date, so a repeat sighting neither pins the URL nor restarts the clock. A `skipped_dup` row with no such row in scan-history ages out by its own `first_seen`, and a tracker or pipeline entry for that URL still pins it. Permanent invalid statuses such as blocked host and malformed URL remain permanent. The other writers of the pipeline apply the same window to the same history: `scan-ats-full.mjs`, `scan-dayforce.mjs`, and everything admitted through `lib/admission-gate.mjs` (`scan-interamt.mjs`, `scan-hn.mjs`, `openrouter-runner.mjs`, plugin ingest).
 
 `scan_history.dedup_include_location` (optional, opt-in, default off) adds the posting location to the company+role dedup key. Off, two postings that share a company and a title are one role however many cities they name — the collapse that keeps an employer with one req per city from leaking a city variant into the pipeline on every scan. On, `Staff Engineer — London` and `Staff Engineer — Dublin` stay two entries instead of the scan keeping whichever one the ATS returned first. Turn it on when eligibility is location-bound (work authorization, relocation, an office to be near): `location_filter` cannot discriminate between two cities it both allows, so the arbitrary survivor may be the city the user cannot legally take. Sources that record no location (a tracker without a Location column, a processed pipeline row) still seed a key matching every city, so a role already applied to never resurfaces city by city.
 
@@ -993,6 +994,42 @@ Defaults are unchanged, so a single-lane setup needs none of this. Note that the
 **Progress:** every 25 sources, and once at the end, the scan prints a line such as `[14:02:31] scan: 50/120 sources done` to stderr. It prints under `--quiet` too, so a long unattended scan never looks stalled, and it stays out of the `--json` receipt on stdout.
 
 **Exit codes:** `0` scan completed, `1` configuration error or no portals.yml found.
+
+---
+
+## triage
+
+Zero-token first-glance triage of the pending queue (#1729). Judges every row in
+`data/pipeline.md`'s `## Pending` section on **title + location alone** — the two
+fields the scanner already wrote — against your `config/profile.yml` targets
+(`target_roles.primary` and `target_roles.archetypes`), and writes a grouped
+shortlist to `data/shortlist.md`. Pure Node: no network, no LLM, no JD read, and
+`data/pipeline.md` is left untouched.
+
+Buckets (same contract as the triage prompt proposed in #1729):
+
+- **Worth a look** — title clearly matches a primary/secondary target AND the
+  location fits (remote, or your profile's city/country).
+- **Maybe** — partial title match, adjacent-tier match, a strong title whose
+  location is missing or needs relocation, or a bare pasted URL with no title.
+- **Skip** — title matches no target role. Location alone never sends a row here.
+
+Title matching is deliberately literal (token overlap with a small
+canonicalization layer: `Machine Learning` = `ML`, `Front-End` = `Frontend`, …).
+To widen the net, add title variants to `target_roles` in your profile — that is
+a profile edit, not a code change.
+
+`data/shortlist.md` is derived and rewritten on every successful run — safe to
+delete. Error exits (bad profile, no targets) leave the previous shortlist in place.
+
+```bash
+npm run triage                # triage ## Pending into data/shortlist.md
+node triage.mjs --json        # same pass, buckets as JSON on stdout
+node scan.mjs --triage        # chain it after a scan (ideal for scheduled runs)
+```
+
+**Exit codes:** `0` shortlist written (or nothing to triage yet), `1` missing or
+invalid `config/profile.yml` / no `target_roles` configured.
 
 ---
 
@@ -1235,6 +1272,7 @@ node ics-interview.mjs < invite.ics
 
 - Display zone: `--tz`, else `config/profile.yml` `location.timezone` (when Intl recognizes it), else the machine zone. A value that is not a zone is reported, not guessed.
 - Unreadable fields are an em dash in the row. All-day events are reported as a date, floating times (no zone, no `Z`) as written without conversion, and a `TZID` that is not an IANA name (e.g. a Windows zone name) as `unknown-tzid` without conversion. `RRULE` is ignored with a warning.
+- A cancellation (`METHOD:CANCEL` or `STATUS:CANCELLED`) gives no row and a `cancelled` warning, since it carries the same start and end as the invite it cancels.
 - `--match` hands the invite text (or a file holding it) to `invite-match.mjs` to suggest the tracker row; Company and Role are filled in only when exactly one candidate matches the company exactly. The length shown comes from the `.ics`.
 - Hand-written parser for the handful of properties needed; zero-LLM, no dependency.
 
@@ -1451,7 +1489,8 @@ Standalone evaluators — run the same evaluation logic
 (`modes/oferta.md` + `modes/_shared.md` + `cv.md`) without an interactive AI
 CLI:
 
-- `gemini:eval` — Google Gemini free tier (`GEMINI_API_KEY` in `.env`)
+- `gemini:eval` — Google Gemini free tier (`GEMINI_API_KEY` in `.env`; copy
+  `.env.example` and get a free key at https://aistudio.google.com/apikey)
 - `ollama:eval` — fully local and private via Ollama
 - `openai:eval` — any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq,
   DeepSeek, LM Studio, llama.cpp, vLLM, ...)
@@ -1523,7 +1562,7 @@ npm run prepare:application -- --url https://boards.greenhouse.io/acme/jobs/123
 Cross-platform build wrapper for the Go TUI dashboard: picks the
 platform-correct output name (`career-dashboard.exe` on Windows, else
 `career-dashboard`), since a bare `go build -o` writes an extension-less
-binary on Windows. Requires Go 1.26+.
+binary on Windows. Requires Go 1.24+.
 
 ```bash
 npm run build:dashboard
@@ -1555,6 +1594,7 @@ These have no `npm run` binding — modes and agents call them with
 | `node install-latex-engine.mjs [--check] [--force] [--json] [--help]` | Opt-in local LaTeX engine: downloads a pinned tectonic release for this platform, verifies its SHA-256 before extracting, and places it in the repo root (gitignored) where `generate-latex.mjs` looks first. Downloads are bounded by a timeout and a size cap. No-op when tectonic is already available (a pdflatex-only host still gets tectonic, which the CJK template needs); `--check` never downloads |
 | `node classify-tier.mjs` | Classify a job title into intern / entry / mid / senior |
 | `node ats-payload.mjs <payload.json> [--summary]` | ATS payload transform: folds `competencies[]` into `skills[]` (one safe, idempotent transform) and reports three judgement calls it deliberately does not apply. Payload on stdout, findings on stderr |
+| `node evidence-freshness.mjs` | Opt-in. Before Block A in `oferta` and `auto-pipeline`, once per run in batch: says whether the GitHub evidence behind `cv.md` is stale (age of the newest `output/github-evidence-*.json`, plus PRs authored and merged since in repos the user does not own, from one metadata-only `gh search prs`). Read-only, always exit 0, JSON on stdout. See [evidence-freshness.mjs](#evidence-freshnessmjs) |
 | `node plugins.mjs list\|run <id> [hook]` | CLI host for non-provider plugin hooks (see [PLUGINS.md](PLUGINS.md)) |
 | `node plugin-install.mjs [--help]` | Clone/scaffold/validate community plugins (allowlisted URLs, pinned SHA); the engine behind the `plugins.mjs` new/add commands, which `--help` points at |
 | `node plugin-audit.mjs` | Static safety scan for community/registry plugins |
@@ -1652,6 +1692,61 @@ Reachable from a mode as the payload stage of `ats` — see [`modes/ats.md`](../
 workflow, including the rule that the three lints are relayed to the user and never applied by the agent.
 
 Self-test: `node ats-payload.mjs --self-test`.
+
+---
+
+## evidence-freshness.mjs
+
+Says whether the GitHub evidence an evaluation scores against is stale.
+`oferta`, `auto-pipeline` and batch workers read `cv.md`, `article-digest.md`
+and the profile, and GitHub work reaches those only when the user runs
+`expand`, whose optional step (`github-evidence.mjs`) writes
+`output/github-evidence-{date}.{md,json}`. The modes run this once, after their
+gates and before Block A. `batch-runner.sh` runs it once per batch run, before
+the first offer, and appends the JSON to every worker's prompt, so a batch
+makes one `gh` call however many offers it has.
+
+The check is opt-in: it does nothing (status `disabled`, no `gh` call) unless
+`config/profile.yml` sets `evidence_freshness.enabled: true`.
+
+```bash
+node evidence-freshness.mjs   # JSON on stdout, always exit 0
+```
+
+- Finds the newest `output/github-evidence-{YYYY-MM-DD}.json` (a file that does
+  not parse, or that records another `user`, is skipped) and reads
+  `candidate.github` from the profile, normalized the way `expand` does it.
+- Makes one metadata-only call through the user's existing `gh auth`:
+  `gh search prs --author <user> --merged --merged-at ">=<scan time>" --limit 100 --json repository -- -user:<user>`.
+  Only the count is kept, no repo names or titles. The lower bound is the scan
+  file's modification time when it falls on the file's date, otherwise the start
+  of that day, so PRs merged earlier on the scan day are not counted again. PRs
+  in the user's own repos are left out, since `github-evidence.mjs` never counts
+  them as evidence. One search page, so a count of 100 is reported as `100+`
+  (`newMergedPrsTruncated`).
+- `stale` is true when `newMergedPrs` reaches `min_new_merged_prs` (default 5)
+  or the scan is more than `max_age_days` old (default 30), from
+  `config/profile.yml` → `evidence_freshness`. With no scan on record it is true
+  once there is at least one merged PR to find. Invalid values keep their
+  default and are reported on stderr.
+- Output: `status`, `stale`, `reason`, `notice` (the one line the modes show
+  when stale), `user`, `lastScan`, `scanFile`, `daysSince`, `newMergedPrs`,
+  `newMergedPrsTruncated`, `thresholds`.
+- `status` is `ok`, or one of `no-github` (`candidate.github` unset or not a
+  username, or the profile is missing or unreadable), `disabled` (the default:
+  `enabled` is not `true`),
+  `gh-unavailable` (`gh` not installed or not logged in) and `gh-query-failed`,
+  each with `stale: false` and a `reason`. It never blocks: the exit code is
+  always `0`.
+
+It writes nothing and never runs `expand` or `github-evidence.mjs`. The modes
+show the notice and continue, never change a score because of it, and record it
+in the report as Machine Summary `evidence_freshness` (`fresh` / `stale` /
+`not_evaluated`, schema in `batch/batch-prompt.md`) plus a
+`**GitHub evidence:**` header line when stale. A `--mode match` batch gets the
+same run-wide result: its report has no Machine Summary, so the worker puts the
+value in the final JSON (`evidence_freshness`, see `batch/batch-prompt-match.md`)
+and adds the same header line when stale. Unattended runs ask nothing.
 
 ---
 
